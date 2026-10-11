@@ -1464,15 +1464,19 @@ verified: 637f7f7bb679 2026-10-05
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
-  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
-  the single source of process detection). The automation TOOLS live in
-  `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
-  TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
-  1 h idle reclaim of one layer never touches another (TinyFish included:
-  leaving it does not end its paid session, which bills until its own idle
-  reclaim); a click that opens a new tab switches the tools to it.
+- **browser/**: profile/state layer only (`profile.py` reads and clears
+  cookies in BOTH local profiles, `~/.genesis/camoufox-profile` and
+  `~/.genesis/browser-profile`, matching domains by whole label and refusing to
+  edit a profile another process has open; the cookie tools use the live
+  browser context instead when this process runs that browser),
+  `BrowserLayer` enum (the navigate result's `layer` values, numbered as in
+  `mcp/health/browser.py`), pgrep patterns as the single source of process
+  detection). The automation TOOLS live in `mcp/health/browser.py`: each layer
+  (Camoufox, Chromium, remote CDP, TinyFish) has its own idle clock and
+  cleanup, so a stale-page restart or the 1 h idle reclaim of one layer never
+  touches another (TinyFish included: leaving it does not end its paid
+  session, which bills until its own idle reclaim); a click that opens a new
+  tab switches the tools to it.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
