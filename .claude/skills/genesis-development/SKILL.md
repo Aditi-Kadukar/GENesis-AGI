@@ -3478,7 +3478,10 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
-  command. The remote git really pushes to must resolve (rewrites applied) to
+  command. Two spellings also qualify: `git -C <path> push …` when `<path>` is
+  the literal, symlink-free top of a worktree of the SAME repository as the
+  session's cwd, and a trailing `2>&1` and/or `| tail -N` / `| head -N`. The
+  remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3488,6 +3491,27 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **Only the main session publishes.** An Agent-tool worker (the hook input
+  carries `agent_id`) may run git and gh only from an ALLOWLIST, whatever
+  `push_publish` says (owner policy 2026-10-05; an allowlist since 2026-10-10,
+  because each review round found a write verb a denylist had missed): local
+  git work plus git's network reads (`fetch`, `pull`, `clone`, `ls-remote`),
+  and gh reads (`gh pr view/list/diff/checks/status/checkout`, `gh issue
+  view/list`, `gh run view/list`, `gh search`, `gh api` GETs and GraphQL
+  queries). Everything else is refused: `git push`, `git lfs lock`, an unknown
+  or aliased git command, every gh write including `gh auth login`, an unknown
+  gh subcommand, a non-GET `gh api` or GraphQL mutation, git options that run a
+  program (`--upload-pack`, `grep -O`, `rebase --exec`), and a command naming
+  git or gh in a form the guard cannot read (a line continuation, a too-long
+  command, a program held in a variable). Not reached: launchers the parse does
+  not open (`eval`, process substitution, `env -S`, a function body) and
+  programs git starts from config or the environment. Re-pushes of an already-published PR branch, dry runs and in-thread
+  finding replies are included. The list is `_GIT_SUBAGENT_OK`,
+  `_GIT_FAMILY_VERBS` and `_GH_SUBAGENT_READS` in `git_push_guard.py`. Commit
+  locally, then hand the worktree path, branch, head SHA, the PR title and body,
+  and any comment or reply you would have posted back to the main session. A
+  subagent dispatched to fix a PR therefore leaves the push and the replies to
+  the session that dispatched it.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending

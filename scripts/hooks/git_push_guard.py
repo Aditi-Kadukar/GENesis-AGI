@@ -343,8 +343,12 @@ try:
         analyze,
         analyze_checked,
         commit_skips_hooks,
+        gh_api_request,
+        gh_command,
         gh_pr_subcommand,
+        gh_requests_help,
         git_subcommand,
+        git_subcommand_index,
         has_trailing_override,
         mentions,
         split_segments,
@@ -5381,7 +5385,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     triggers = [
         (seg, body, signal)
         for seg in segs
-        if gh_pr_subcommand(seg.argv) == "comment"
+        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
         for body, _opaque, signal in (_comment_review_request(seg.argv),)
         if signal is not False
     ]
@@ -11667,6 +11671,431 @@ def _is_dispatched() -> bool:
     return os.environ.get("GENESIS_CC_SESSION") == "1"
 
 
+def _is_subagent(payload) -> bool:
+    """True when this hook call comes from inside a SUBAGENT (an Agent-tool worker).
+
+    Keyed on ``agent_id`` in the hook input and nothing else. Claude Code's own
+    hook-input schema (READ in the 2.1.280 binary, and the hooks reference) says
+    ``agent_id`` is "Present only when the hook fires from within a subagent …
+    Absent for the main thread, even in --agent sessions. Use this field (not
+    agent_type) to distinguish subagent calls from main-thread calls."
+    ``agent_type`` is deliberately NOT read: a main session started with
+    ``--agent`` carries it too, and that session has a human at the prompt.
+
+    A missing, empty or non-string ``agent_id`` reads as the main thread, so a
+    payload this guard does not recognise keeps today's behaviour (the ordinary
+    push gates) rather than inventing a refusal."""
+    if not isinstance(payload, dict):
+        return False
+    agent_id = payload.get("agent_id")
+    return isinstance(agent_id, str) and bool(agent_id.strip())
+
+
+#: What a SUBAGENT may run of git and gh: an ALLOWLIST (owner ruling 2026-10-10).
+#: The earlier denylist of writing commands lost a write verb to every review
+#: round, because the write verbs of git, git-lfs and gh are an open set. Now a
+#: segment is allowed only when it is on these lists; anything else, and anything
+#: whose command this guard cannot read, is refused.
+#:
+#: git: every subcommand that works on the local repository, plus the network
+#: READS (fetch, pull, clone, ls-remote, fetch-pack). Taken from
+#: ``git --list-cmds=main,others`` (git 2.43) MINUS the network writers (push,
+#: send-pack, http-push), the server and transport ends (receive-pack,
+#: upload-pack, upload-archive, daemon, http-backend, shell, remote-*, instaweb),
+#: mail (imap-send), credential access (credential*), commands whose job is to
+#: run other commands (for-each-repo, filter-branch, difftool, mergetool, hook)
+#: and git's internal helpers. Options that make a listed command run a program
+#: are refused per command (``_GIT_RUNS_A_PROGRAM``, ``_GIT_REBASE_EXEC``); config
+#: and environment that do the same (``-c core.sshCommand``) are not read. Not listed, so refused: a git alias, an external
+#: ``git-<name>``, ``subtree``, ``svn``, ``send-email``, a newer git's command.
+_GIT_SUBAGENT_OK = frozenset(
+    """
+    add am annotate apply archive bisect blame branch bugreport bundle cat-file
+    check-attr check-ignore check-mailmap check-ref-format checkout
+    checkout-index cherry cherry-pick clean clone column commit commit-graph
+    commit-tree config count-objects describe diagnose diff diff-files
+    diff-index diff-tree fast-export fast-import fetch fetch-pack fmt-merge-msg
+    for-each-ref format-patch fsck fsck-objects gc get-tar-commit-id grep
+    hash-object help index-pack init init-db interpret-trailers lfs log ls-files
+    ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file
+    merge-index merge-tree mktag mktree multi-pack-index mv name-rev notes
+    pack-objects pack-redundant pack-refs patch-id prune prune-packed pull
+    quiltimport range-diff read-tree rebase reflog remote repack replace
+    request-pull rerere reset restore rev-list rev-parse revert rm shortlog show
+    show-branch show-index show-ref sparse-checkout stage stash status
+    stripspace submodule switch symbolic-ref tag unpack-file unpack-objects
+    update-index update-ref update-server-info var verify-commit verify-pack
+    verify-tag version whatchanged worktree write-tree
+    """.split()  # noqa: SIM905 - a word list kept readable
+)
+#: git commands that are families: their first word after the family name must
+#: be one of these (none at all lists or prints help). Left out on purpose:
+#: ``lfs push``/``lock``/``unlock`` (write the LFS server), ``lfs pre-push``,
+#: ``submodule foreach`` and ``bisect run`` (run arbitrary commands).
+_GIT_FAMILY_VERBS: dict[str, frozenset[str]] = {
+    "lfs": frozenset({
+        "checkout", "clone", "env", "fetch", "fsck", "install", "locks",
+        "logs", "ls-files", "migrate", "pointer", "prune", "pull", "status",
+        "track", "uninstall", "untrack", "update", "version", "help"
+    }),
+    "submodule": frozenset({
+        "status", "summary", "init", "deinit", "update", "sync",
+        "absorbgitdirs", "set-branch", "set-url", "add"
+    }),
+    "remote": frozenset({
+        "add", "rename", "remove", "rm", "set-head", "set-branches",
+        "get-url", "set-url", "show", "prune", "update"
+    }),
+    "bisect": frozenset({
+        "start", "bad", "good", "new", "old", "terms", "skip", "reset",
+        "visualize", "view", "replay", "log", "help"
+    }),
+}
+#: Options that make an allowlisted git command run a program it names:
+#: ``(long options, short option letters)``. git accepts any unambiguous prefix
+#: of a long option, so a token counts when it is a prefix of one listed here
+#: (four characters or more, which over-refuses a few harmless prefixes).
+_GIT_RUNS_A_PROGRAM: dict[str, tuple[tuple[str, ...], str]] = {
+    "fetch": (("--upload-pack",), ""),
+    "pull": (("--upload-pack",), ""),
+    "clone": (("--upload-pack", "--config", "--template"), "uc"),
+    "ls-remote": (("--upload-pack",), "u"),
+    "fetch-pack": (("--upload-pack", "--exec"), ""),
+    "archive": (("--exec",), ""),
+    "grep": (("--open-files-in-pager",), "O"),
+}
+#: ``git rebase --exec``/``-x`` runs a command per commit. git accepts any
+#: unambiguous prefix of a long option, so ``--ex`` is ``--exec``.
+_GIT_REBASE_EXEC = re.compile(r"--ex|-[A-Za-z]*x")
+
+#: gh: the read-only subcommands of each group. Every other subcommand, and every
+#: group not listed (``codespace``, ``browse``, ``completion``, an extension or a
+#: ``gh alias`` name), is refused. ``auth`` keeps only ``status``: ``login`` can
+#: upload an SSH key and ``refresh`` changes token scopes.
+_GH_SUBAGENT_READS: dict[str, frozenset[str]] = {
+    "pr": frozenset({"list", "ls", "view", "diff", "checks", "status", "checkout", "co"}),
+    "issue": frozenset({"list", "ls", "view", "status"}),
+    "run": frozenset({"list", "ls", "view", "watch", "download"}),
+    "workflow": frozenset({"list", "ls", "view"}),
+    "release": frozenset({"list", "ls", "view", "download", "verify", "verify-asset"}),
+    "repo": frozenset({"list", "ls", "view", "clone", "gitignore", "license"}),
+    "search": frozenset({"code", "commits", "issues", "prs", "repos"}),
+    "label": frozenset({"list", "ls"}),
+    "gist": frozenset({"list", "ls", "view", "clone"}),
+    "cache": frozenset({"list", "ls"}),
+    "secret": frozenset({"list", "ls"}),
+    "variable": frozenset({"list", "ls", "get"}),
+    "project": frozenset({"list", "ls", "view", "field-list", "item-list"}),
+    "ruleset": frozenset({"list", "ls", "view", "check"}),
+    "discussion": frozenset({"list", "ls", "view"}),
+    "org": frozenset({"list", "ls"}),
+    "extension": frozenset({"list", "ls", "search"}),
+    "alias": frozenset({"list", "ls"}),
+    "auth": frozenset({"status"}),
+    "config": frozenset({"get", "list"}),
+    "ssh-key": frozenset({"list", "ls"}),
+    "gpg-key": frozenset({"list", "ls"}),
+    "attestation": frozenset({"verify"}),
+}
+#: gh commands with no subcommands that only print: allowed whatever follows.
+_GH_SUBAGENT_LEAF_READS = frozenset({"status", "version", "help", "reference", "licenses"})
+#: gh's own aliases (``gh ext``, ``gh rs``; root ``gh co`` is ``gh pr checkout``).
+_GH_GROUP_ALIASES = {
+    "ext": "extension",
+    "extensions": "extension",
+    "rs": "ruleset",
+    "at": "attestation",
+}
+_GH_ROOT_READ_ALIASES = frozenset({"co"})
+
+#: A gh command word: what a real group, alias or extension name looks like
+#: (extensions and aliases may carry capitals, digits, dots and underscores).
+#: A segment whose "group" is anything else (``=`` from a here-doc line
+#: ``gh = Fake()``) is text, not a gh call: gh would reject it as an unknown
+#: command, so it runs nothing.
+_GH_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+#: Before the verb, gh's command lookup treats any flag the group does not
+#: declare as taking a value and swallows the next word (MEASURED, gh 2.101:
+#: ``gh pr --admin view merge --help`` prints ``pr merge``'s help). Only these
+#: are declared at the group level: ``-R``/``--repo`` take a value, help takes
+#: none. ``--version`` is NOT one: it belongs to the root command alone, so
+#: after a group word gh swallows the next word for it too (MEASURED:
+#: ``gh pr --version view comment`` resolves to ``pr comment``).
+_GH_PREPATH_VALUE = frozenset({"-R", "--repo"})
+_GH_PREPATH_BOOL = frozenset({"-h", "--help"})
+
+_GRAPHQL_READ_START = re.compile(r"\s*(?:(?:query|fragment)\b|\{)")
+_GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+
+
+def _graphql_without_literals(q: str) -> str | None:
+    """``q`` with every GraphQL string, block string and comment replaced by a
+    space, so ``mutation`` inside a search string or a comment is not read as an
+    operation. Per the GraphQL lexical grammar: ``\"\"\"`` opens a block string
+    closed by an unescaped ``\"\"\"`` (``\\\"\"\"`` is its only escape), ``"`` opens a
+    string closed by an unescaped ``"`` on the same line, and ``#`` outside a
+    string runs to the end of the line. None for an unterminated string: the
+    caller then counts the query as a write."""
+    out: list[str] = []
+    i, n = 0, len(q)
+    while i < n:
+        if q.startswith('"""', i):
+            j = i + 3
+            while not q.startswith('"""', j):
+                if j >= n:
+                    return None
+                j += 4 if q.startswith('\\"""', j) else 1
+            i = j + 3
+            out.append(" ")
+        elif q[i] == '"':
+            j = i + 1
+            while j < n and q[j] != '"':
+                if q[j] in "\r\n":
+                    return None
+                j += 2 if q[j] == "\\" else 1
+            if j >= n:
+                return None
+            i = j + 1
+            out.append(" ")
+        elif q[i] == "#":
+            while i < n and q[i] not in "\r\n":
+                i += 1
+            out.append(" ")
+        else:
+            out.append(q[i])
+            i += 1
+    return "".join(out)
+
+
+def _graphql_is_query(q: str) -> bool:
+    """Whether the GraphQL document ``q`` defines only queries (and fragments).
+
+    An operation's kind is the keyword at the document's TOP LEVEL, outside every
+    ``{}`` and ``()``: there ``mutation``/``subscription`` start an operation and
+    ``{`` an anonymous query. Inside the brackets the same word is an alias, a
+    field or a ``$variable``, and in a string or comment it is text, so neither
+    makes a read a write. The document must also start as a query or a fragment
+    (``query``, ``fragment`` or ``{``). Anything this cannot read is not a query: a shell expansion, an
+    unterminated string, unbalanced brackets."""
+    if "$(" in q or "${" in q or "`" in q or not _GRAPHQL_READ_START.match(q):
+        return False
+    bare = _graphql_without_literals(q)
+    if bare is None:
+        return False
+    depth, top = 0, []
+    for ch in bare:
+        if ch in "{(":
+            depth += 1
+            top.append(" ")
+        elif ch in "})":
+            depth -= 1
+            if depth < 0:
+                return False
+            top.append(" ")
+        else:
+            top.append(ch if depth == 0 else " ")
+    if depth:
+        return False
+    return not {"mutation", "subscription"} & set(_GRAPHQL_NAME.findall("".join(top)))
+
+
+def _gh_api_is_read(argv: list[str]) -> bool:
+    """Whether a ``gh api`` argv only reads from GitHub.
+
+    REST: the effective method is GET or HEAD (``shell_parse.gh_api_request``
+    applies gh's defaulting: a parameter makes it POST unless ``-X GET`` keeps
+    it a query string), with no ``--input``, no method-override header and no
+    flag the parse does not model (its value could be a method). GraphQL is
+    always POST, so it is a read only when every ``query`` field is a literal
+    document :func:`_graphql_is_query` accepts and there is no ``--input``. A
+    query from a file (``@``), a variable or a substitution is not a read."""
+    req = gh_api_request(argv)
+    if req is None or req.unmodelled or req.has_input:
+        return False
+    if any("method-override" in t.lower() for t in argv):
+        return False
+    if (req.endpoint or "").strip("/").lower() == "graphql":
+        queries = [v for k, v in req.fields if k == "query"]
+        return bool(queries) and all(_graphql_is_query(q) for q in queries)
+    return req.method in ("GET", "HEAD")
+
+
+def _gh_prepath_is_plain(argv: list[str], path_end: int) -> bool:
+    """Whether every flag before the verb is one gh's lookup reads as we do.
+
+    Any other flag there makes gh swallow the next word (see
+    ``_GH_PREPATH_VALUE``), so the word this guard reads as the verb may be a
+    value and the real verb the word after it: ``gh pr --admin view merge`` runs
+    ``pr merge``. Rather than model which words are swallowed, such a command is
+    not trusted as a read."""
+    i = 1
+    while i < path_end and i < len(argv):
+        tok = argv[i]
+        if tok.startswith("-") and tok != "-":
+            name = tok.split("=", 1)[0]
+            if name in _GH_PREPATH_VALUE or tok[:2] == "-R":
+                i += 1 if ("=" in tok or (tok[:2] == "-R" and len(tok) > 2)) else 2
+                continue
+            if tok in _GH_PREPATH_BOOL:
+                i += 1
+                continue
+            return False
+        i += 1
+    return True
+
+
+def _git_subagent_refusal(argv: list[str]) -> str | None:
+    """Why a subagent may not run this git argv, or None when it may."""
+    idx = git_subcommand_index(argv)
+    if idx is None:
+        return None  # `git`, `git --version`, `git -C dir`: no subcommand runs
+    sub, rest = argv[idx], argv[idx + 1 :]
+    if sub not in _GIT_SUBAGENT_OK:
+        return f"git {sub}"
+    verbs = _GIT_FAMILY_VERBS.get(sub)
+    if verbs is not None:
+        word = next((t for t in rest if not t.startswith("-")), None)
+        if word is not None and word not in verbs:
+            return f"git {sub} {word}"
+    if sub == "rebase" and any(_GIT_REBASE_EXEC.match(t) for t in rest):
+        return "git rebase --exec"
+    runs = _GIT_RUNS_A_PROGRAM.get(sub)
+    if runs is not None:
+        longs, shorts = runs
+        for t in rest:
+            name = t.split("=", 1)[0]
+            if (name.startswith("--") and len(name) >= 4 and any(o.startswith(name) for o in longs)) or (
+                shorts and re.match(rf"-[A-Za-z]*[{shorts}]", t)
+            ):
+                return f"git {sub} {name} (runs a program)"
+    return None
+
+
+def _subagent_refusal(seg) -> str | None:
+    """A short label for a git or gh segment a subagent may NOT run, else None.
+
+    Allowed: what :data:`_GIT_SUBAGENT_OK` and :data:`_GIT_FAMILY_VERBS` list
+    for git; for gh, a subcommand :data:`_GH_SUBAGENT_READS` lists, a leaf in
+    :data:`_GH_SUBAGENT_LEAF_READS`, a help request, or a ``gh api`` call
+    :func:`_gh_api_is_read` accepts. Everything else is refused, including a
+    segment whose verb the parse could not resolve. Other programs are not this
+    rule's subject and return None."""
+    exe = getattr(seg, "exe", "")
+    if exe not in ("git", "gh"):
+        return None
+    argv = list(getattr(seg, "argv", None) or [])
+    if getattr(seg, "verb_unresolved", False):
+        return f"{exe} (its subcommand is built at run time)"
+    if exe == "git":
+        return _git_subagent_refusal(argv)
+    inv = gh_command(argv)
+    if inv is None:
+        # No command path: bare `gh`, `gh --version`, or flags only.
+        extra = [t for t in argv[1:] if t not in ("--help", "--version", "-h", "-v")]
+        return "gh (no readable command)" if extra else None
+    # A flag gh's root does not declare swallows the NEXT word, so with one
+    # before the group the word read as the group is a value and the command
+    # runs from the word after it (MEASURED, gh 2.101: `gh --yes o/r repo
+    # delete` is `repo delete`). Checked before every early return below.
+    if not _gh_prepath_is_plain(argv, inv.path_end):
+        return f"gh {inv.group} (a flag before the command hides which command runs)"
+    if not _GH_WORD.fullmatch(inv.group):
+        return None  # here-doc text such as `gh = Fake()`, not a gh call
+    if inv.group in _GH_ROOT_READ_ALIASES and argv[1] == inv.group:
+        # gh's default `co` alias (`gh pr checkout`). gh expands an alias only
+        # as the first word. A user can redefine `co` with `gh alias set
+        # --clobber`; that is not visible here.
+        return None if "--" not in argv else "gh co (git options after --)"
+    group = _GH_GROUP_ALIASES.get(inv.group, inv.group)
+    verb = inv.subcommand or (inv.positionals[0] if inv.positionals else None)
+    # Where the command path ends in argv: after the verb when there is one (a
+    # group gh_command does not model leaves its verb as the first positional,
+    # so find it). With no verb, every word after the group was a flag value,
+    # for gh as for the walk, so nothing is hidden: the path ends at the group.
+    if inv.subcommand is not None or verb is None or group not in _GH_SUBAGENT_READS:
+        lookup_end = inv.path_end
+    elif verb in argv[inv.path_end :]:
+        lookup_end = argv.index(verb, inv.path_end) + 1
+    else:
+        lookup_end = len(argv)
+    if not _gh_prepath_is_plain(argv, lookup_end):
+        return f"gh {group} (a flag before the verb hides which command runs)"
+    if gh_requests_help(argv):
+        return None  # help only: gh prints it and runs nothing
+    if group == "api":
+        return None if _gh_api_is_read(argv) else "gh api (not a plain read)"
+    if group in _GH_SUBAGENT_LEAF_READS:
+        return None
+    reads = _GH_SUBAGENT_READS.get(group)
+    if reads is None:
+        return f"gh {group}"
+    if verb is None or verb in reads:
+        # `gh repo clone`/`gh pr checkout` pass words after `--` to git, which
+        # can name a program to run (`--upload-pack`, `--config`).
+        if "--" in argv and verb in ("clone", "checkout", "co"):
+            return f"gh {group} {verb} (git options after --)"
+        return None
+    return f"gh {group} {verb}"
+
+
+#: The refusal for a non-read from inside a subagent. Written for the agent, and
+#: complete enough that it needs no human: what to do instead, and what to hand
+#: back. The owner sees nothing — a deny is not a prompt. Policy, not a scope
+#: judgement: it covers re-pushes of already-published branches, dry runs, PR
+#: comments and review requests too, which from the main thread may pass without
+#: any prompt.
+_SUBAGENT_PUBLISH_DENY = (
+    "BLOCKED: only the main session publishes. A subagent may run only known "
+    "read-only git/gh commands, and this one is not on that list ({what}); by "
+    "owner policy pushes, PRs, comments, review requests and every other GitHub "
+    "write are the main session's steps, whatever the branch's state.\n"
+    "Instead: commit your work locally on its branch and STOP. Report back to "
+    "the main session: the worktree path, the branch name, the head SHA "
+    "(`git rev-parse HEAD`), and the PR title and body you would have used "
+    "(write the body to a file and give its path), plus any comment, review "
+    "request or reply you would have posted. The main session publishes them. "
+    "Do not retry the write in another spelling. If it is in fact a read, "
+    "write it in the plain form (`gh pr view`, `gh api <endpoint>`, `git fetch`)."
+)
+#: A command whose segments the parse withholds (a line continuation, a length
+#: or nesting bound), or one whose program is named by an expansion
+#: (``G=gh; $G pr comment``), cannot be checked against the allowlist, so a
+#: subagent's such command naming git or gh is refused.
+_GIT_OR_GH_MENTION = re.compile(r"\b(?:git|gh)\b")
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _program_may_be_git_or_gh(seg, cmd: str) -> bool:
+    """Whether a segment's program is an expansion that can be git or gh: a
+    substitution naming either (``$(echo gh) pr comment``), or a variable this
+    command assigns a git/gh path to (``G=gh; $G pr comment``). A variable set
+    outside the command is not visible here. Narrow on purpose (MEASURED over
+    44,279 recorded subagent commands, 2026-10-10): refusing every expanded
+    program in a command that merely mentions git refused 195, nearly all
+    scripts run from a variable path; this test refuses 51, mostly
+    ``G="git -C <dir>"; $G …`` spellings, which do run git."""
+    argv = list(getattr(seg, "argv", None) or [])
+    word = argv[0] if argv else ""
+    if "$(" in word or "`" in word:
+        # The substitution's text spans argv words; read the segment's own text.
+        return bool(_GIT_OR_GH_MENTION.search(getattr(seg, "raw", "") or word))
+    m = _VAR_REF.match(word)
+    if not m:
+        return False
+    assign = rf"(?:^|[\s;&|(]){re.escape(m.group(1))}=[\"']?(?:\S*/)?(?:git|gh)[\"']?(?=[\s;&|)]|$)"
+    return re.search(assign, cmd) is not None
+_SUBAGENT_UNREADABLE_DENY = (
+    "BLOCKED: this command names `git` or `gh` in a form this guard cannot read "
+    "(a line continuation, a command too long or too deeply nested, or a "
+    "program named by a variable or substitution), from "
+    "inside a subagent, so it cannot be checked against the read-only list. Put "
+    "each git/gh command on one line, as its own short command: a read then runs, "
+    "and a GitHub write is the main session's step (commit locally and report "
+    "back the worktree path, branch and head SHA instead)."
+)
+
+
 # git push flags that consume the NEXT token as their value — so a value that
 # happens to start with '+' or contain 'f' is not misread as a force.
 _PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
@@ -12949,7 +13378,26 @@ def _no_url_rewrite_rules(cwd: str | None) -> bool:
     return got is not None and got[0] == 1
 
 
-def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None) -> bool:
+#: Environment variables that pick a DIFFERENT repository, ref namespace or git
+#: program set than the one the checks below read through ``git -C <cwd>``. Set
+#: in the hook's environment, any of them keeps the ask. A per-command
+#: ``GIT_DIR=…`` prefix is refused separately (``_push_seg_has_no_prefix``); an
+#: ``export`` earlier in the command makes the cwd unknown (``_effective_cwd``).
+#: Same residue as ``_TRANSPORT_ENV``: a variable exported only in the Bash
+#: tool's shell profile is invisible here.
+_REPO_SELECTION_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_EXEC_PATH",
+)
+
+
+def _repo_selection_env_set() -> bool:
+    """Whether any ``_REPO_SELECTION_ENV`` variable is set in this process."""
+    return any(os.environ.get(v) for v in _REPO_SELECTION_ENV)
+
+
+def _push_publish_scope_holds(
+    push_remote, segs, push_seg, cmd, cwd, branch=None, hook_cwd=None
+) -> bool:
     """Whether a FIRST push of the current branch may go unprompted under
     ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
     repo and nothing else in the command can change that.
@@ -12964,13 +13412,24 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
         to expand, so it qualifies only when no rewrite rule exists at all;
       * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
       * the command is exactly ONE plain ``git push`` (``_is_single_plain_push``)
-        — no other segment at all, since any neighbour can change the push after
-        this check (a ``cd``, a hook, an fsmonitor, a clean filter);
+        — no other segment that runs before or beside it, since any neighbour can
+        change the push after this check (a ``cd``, a hook, an fsmonitor, a clean
+        filter). The two harmless spellings it admits — ``git -C <the top of a
+        worktree of this same repository>`` and an output-only ``2>&1 | tail -N``
+        suffix — are judged there; ``cwd`` is the directory every check below
+        reads, so a ``-C`` push is judged in the worktree it names;
+      * no repository-selecting variable (``_REPO_SELECTION_ENV``) is set in the
+        hook's environment;
       * a live probe confirms the branch is absent on the destination.
     Anything else returns False and the prompt stands."""
     if not push_remote:
         return False
-    if not _is_single_plain_push(segs, push_seg, cmd):
+    # FIRST, before any helper shells out: every probe below inherits this
+    # environment, so a repository-selecting variable would answer each of them
+    # about the overriding repository instead of the one named.
+    if _repo_selection_env_set():
+        return False
+    if not _is_single_plain_push(segs, push_seg, cmd, hook_cwd=hook_cwd, push_cwd=cwd):
         return False
     named = _raw_remote_push_urls(push_remote, cwd)
     if named is None:
@@ -13004,36 +13463,163 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
 _SINGLE_PUSH_FORBIDDEN = frozenset(";&|<>(){}$`\\\n\r*?[")
 
 
-def _is_single_plain_push(segs, push_seg, cmd: str) -> bool:
-    """Whether the WHOLE command is exactly one top-level ``git push …``.
+#: The only later stages a silenced first push may pipe into: ``head`` or ``tail``
+#: with a line count, and nothing else — no file operand, no ``-f``, no ``-c``,
+#: no ``+N``. Both only read stdin and write stdout, so neither can change where
+#: the push lands. One side effect is stated rather than hidden: ``head`` exits
+#: after N lines, and git's next write to the pipe can then die of SIGPIPE, cutting
+#: a push short (perhaps before ``-u`` records the upstream). That can only make
+#: less happen, never something else. A CLOSED set on purpose:
+#: ``tee`` writes files, ``xargs``/``sh``/``bash`` run what they read, and an
+#: open "filters are fine" rule is the neighbour allowlist that two audit rounds
+#: already outran.
+_PUSH_OUTPUT_FILTER = re.compile(r"(?:head|tail)[ \t]+(?:-[0-9]{1,6}|-n[ \t]+[0-9]{1,6})")
+_PUSH_OUTPUT_FILTER_EXES = frozenset({"head", "tail"})
+#: ``2>&1`` on the push itself: stderr joins stdout, which goes to the pipe or
+#: the terminal. Never a file — ``>`` with a path stays forbidden.
+_PUSH_STDERR_MERGE = re.compile(r"(?P<text>.*?)[ \t]+2>&1[ \t]*", re.DOTALL)
 
-    The ``push_publish`` suppression judges the repository the hook payload's
-    cwd names, before anything runs. Anything else in the command can change
-    what the push does after that judgement — a ``cd`` (through ``CDPATH``, in a
-    pipeline, in the background), a ``git status`` that runs ``core.fsmonitor``,
-    a ``git add`` that runs a clean filter, a ``git commit`` whose hook rewrites
-    the push URL or switches branch, a ``-C`` through a symlink. Two audit rounds
-    found members of that class faster than a neighbour allowlist could absorb
-    them, so the rule is structural: one segment, which is the push itself; no
-    shell metacharacter anywhere; the text re-tokenizes to exactly its argv
-    (no assignment prefix, no wrapper); and ``push`` immediately follows ``git``
-    (no global option at all: ``-C``, ``-c``, ``--git-dir``, ``--work-tree``,
-    ``--namespace``, ``--config-env``, …). Applies to the suppression only; the
-    re-push allow keeps ``_push_compound_is_inert``."""
-    if len(segs) != 1 or segs[0] is not push_seg:
+
+def _split_push_output_suffix(cmd: str):
+    """``(push_text, filter_argvs)`` when ``cmd`` is ``<push_text>[ 2>&1][ | <filter>]…``
+    with every filter matching ``_PUSH_OUTPUT_FILTER``; ``(cmd, [])`` when there
+    is no such suffix; None when a ``|`` stage is anything else.
+
+    Text-level and CLOSED: the suffix vocabulary is ``|``, ``2>&1``, ``head``,
+    ``tail``, ``-n``, digits and blanks, so no quote, ``#``, ``&``, ``;``, ``>``
+    or newline can hide in it. A ``|`` inside a quoted push argument splits the
+    push text here, which leaves an unbalanced quote or a non-filter stage and
+    so refuses — never the other way round. ``|&`` and ``||`` leave a stage that
+    is not a filter, and refuse too."""
+    head, *stages = cmd.split("|")
+    filters: list[list[str]] = []
+    for stage in stages:
+        stage = stage.strip(" \t")
+        if not _PUSH_OUTPUT_FILTER.fullmatch(stage):
+            return None
+        filters.append(stage.split())
+    m = _PUSH_STDERR_MERGE.fullmatch(head)
+    text = m.group("text") if m else head
+    if not stages and not m:
+        return cmd, []
+    if "#" in cmd:
+        # A comment would swallow the suffix (or the push's own tail) in bash
+        # while this split still reads it. Never worth modelling.
+        return None
+    return text, filters
+
+
+def _git_toplevel(path: str) -> str | None:
+    """``git -C <path> rev-parse --show-toplevel``, or None on any failure."""
+    got = _run_git_lines(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    if got is None or got[0] != 0 or len(got[1]) != 1:
+        return None
+    return got[1][0]
+
+
+def _dash_c_names_sibling_worktree(path: str, hook_cwd) -> bool:
+    """Whether ``git -C <path>`` provably names the TOP of a worktree of the same
+    repository as the session's own cwd — the one ``-C`` the ``push_publish``
+    suppression admits.
+
+    Each condition closes a way ``-C`` reached a different repository than the
+    one the guard judged:
+      * ``path`` is ABSOLUTE and equals its own ``realpath`` — no symlink in any
+        component, no ``..``, no ``~`` (bash expands a leading tilde; Python's
+        realpath does not, so an unexpanded ``~`` can never compare equal), no
+        trailing slash. That is the audited ``-C lnk/..`` class: git follows the
+        link before applying ``..``, ``normpath`` does not;
+      * ``path`` IS the worktree's top level (``rev-parse --show-toplevel``), so
+        it is not a subdirectory whose own nested repository git would find;
+      * its git common dir equals the hook cwd's (both realpath'd), so it is a
+        worktree of THIS repository. Per-worktree config (``config.worktree``
+        under ``extensions.worktreeConfig``) can still differ — a pushurl, a
+        rewrite, a ``core.hooksPath`` — which is why every scope check after
+        this one reads ``push_cwd``, the ``-C`` directory itself: the push is
+        judged exactly as a plain ``git push`` run inside that worktree.
+    Anything unreadable → False, and the push keeps its prompt. The literalness
+    of the word itself (no ``$``, glob, brace or backslash) is enforced by the
+    caller's ``_SINGLE_PUSH_FORBIDDEN`` scan.
+
+    Refuses on its own when a ``_REPO_SELECTION_ENV`` variable is set, rather than
+    relying on its caller to have checked: the git probes below inherit this
+    environment, and a ``GIT_DIR`` there makes ``-C`` irrelevant, so two
+    unrelated directories would both report the overriding repository's top
+    level and common dir (MEASURED by review: the comparison then passes)."""
+    if _repo_selection_env_set():
         return False
+    if not isinstance(path, str) or not isinstance(hook_cwd, str) or not hook_cwd:
+        return False
+    if not os.path.isabs(path):
+        return False
+    try:
+        if os.path.realpath(path) != path:
+            return False
+    except (OSError, ValueError):
+        return False
+    if _git_toplevel(path) != path:
+        return False
+    mine = _git_common_dir(path)
+    return mine is not None and mine == _git_common_dir(hook_cwd)
+
+
+def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None) -> bool:
+    """Whether the WHOLE command is exactly one top-level ``git push …``, in one
+    of the few spellings that cannot change what the push does.
+
+    The ``push_publish`` suppression judges the repository the push's cwd names,
+    before anything runs. Anything else in the command can change what the push
+    does after that judgement — a ``cd`` (through ``CDPATH``, in a pipeline, in
+    the background), a ``git status`` that runs ``core.fsmonitor``, a ``git
+    add`` that runs a clean filter, a ``git commit`` whose hook rewrites the push
+    URL or switches branch, a ``-C`` through a symlink. Two audit rounds found
+    members of that class faster than a neighbour allowlist could absorb them,
+    so the rule is structural: the push is the only segment that is not an
+    output filter; no shell metacharacter in the push text; the text
+    re-tokenizes to exactly its argv (no assignment prefix, no wrapper); and
+    ``push`` immediately follows ``git`` — except for exactly ONE global option:
+
+      * ``git -C <path> push …`` where ``_dash_c_names_sibling_worktree`` holds
+        for the payload's cwd (``hook_cwd``) and ``<path>`` is the directory the
+        caller resolved and judged (``push_cwd``). Every other global option —
+        ``-c``, ``--git-dir``, ``--work-tree``, ``--namespace``,
+        ``--config-env``, a second ``-C``, the pager switches — still refuses.
+
+    And exactly one suffix (``_split_push_output_suffix``): ``2>&1`` on the push
+    and/or a pipeline into ``head``/``tail`` line counts. Those stages start
+    beside the push, but they read stdin and write stdout and cannot touch the
+    repository, its config or the network; each must also be a parsed top-level
+    segment whose argv is the filter exactly. Applies to the suppression only;
+    the re-push allow keeps ``_push_compound_is_inert``."""
+    split = _split_push_output_suffix(cmd)
+    if split is None:
+        return False
+    text, filters = split
+    if len(segs) != 1 + len(filters) or segs[0] is not push_seg:
+        return False
+    for seg, words in zip(segs[1:], filters, strict=True):
+        if getattr(seg, "depth", 0) or getattr(seg, "exe", "") not in _PUSH_OUTPUT_FILTER_EXES:
+            return False
+        if list(getattr(seg, "argv", None) or []) != words:
+            return False
     if getattr(push_seg, "depth", 0):
         return False
-    if any(c in _SINGLE_PUSH_FORBIDDEN for c in cmd):
+    if any(c in _SINGLE_PUSH_FORBIDDEN for c in text):
         return False
     if not _push_seg_has_no_prefix(push_seg):
         return False
     try:
-        words = shlex.split(cmd, comments=True)
+        words = shlex.split(text, comments=True)
     except ValueError:
         return False
     argv = list(getattr(push_seg, "argv", None) or [])
-    return words == argv and len(words) >= 2 and words[0] == "git" and words[1] == "push"
+    if words != argv or len(words) < 2 or words[0] != "git":
+        return False
+    if words[1] == "push":
+        return True
+    if len(words) >= 4 and words[1] == "-C" and words[3] == "push":
+        return push_cwd == words[2] and _dash_c_names_sibling_worktree(words[2], hook_cwd)
+    return False
 
 
 def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
@@ -13400,7 +13986,11 @@ def _run_merge_and_push_gates() -> int:
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
-        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
+        # A help request creates nothing; it used to raise the create arm's ask.
+        create_segs = [
+            s for s in segs
+            if gh_pr_subcommand(s.argv) == "create" and not gh_requests_help(s.argv)
+        ]
         # `gh pr merge --help` merges nothing; it used to be refused as a merge
         # without --admin (#2768).
         merge_pr_segs = [
@@ -13601,6 +14191,51 @@ def _run_merge_and_push_gates() -> int:
                 "keep the launcher for the work that needs it and issue the "
                 "gated command as its own Bash call."
             )
+
+        # ── Only the main session publishes ────────────────────────────────
+        # Inside an Agent-tool worker, git and gh run only from an ALLOWLIST of
+        # reads and local git work (owner policy 2026-10-05, made an allowlist
+        # 2026-10-10 after each review round found a write verb the denylist
+        # missed). A fan-out of agents each publishing its own branch put a run
+        # of approval prompts in front of the owner, and a subagent's `@codex
+        # review` request prompted the same way. Classified per segment by
+        # `_subagent_refusal`; anything not listed, including a verb built at run
+        # time, is refused with the hand-back message. It is a blanket rule, not
+        # a prompt substitute: a re-push the main thread would be allowed
+        # silently, a dry run, an ordinary PR comment and an in-thread finding
+        # reply are refused too. Ahead of the multiple-publish check so a
+        # subagent is not first told to split a command whose halves are each
+        # refused, and ahead of the round-escalation lookup, so a subagent's
+        # review request costs no network call. Reach: every segment the parse
+        # resolves, nested ones included; a command whose segments the parse
+        # withholds, or whose program is an expansion, and that names git or gh
+        # is refused below. NOT reached: a write run through a launcher the parse
+        # does not open (`eval`, `find -exec`, `watch`, a pipe into `bash`,
+        # process substitution, `env -S`, a shell function's body), a program
+        # git itself starts from config or the environment (a hook,
+        # `-c core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SEQUENCE_EDITOR`, a
+        # credential helper), a write made by a program that is not git or gh
+        # (curl to the API, another CLI), and anything outside the Bash tool (an
+        # MCP GitHub tool).
+        # This instructs a cooperating agent; it is not a security boundary. A
+        # main-thread session carries no `agent_id` and is unaffected, `--agent`
+        # sessions included.
+        if _is_subagent(payload):
+            refused = [w for w in map(_subagent_refusal, segs) if w]
+            if refused:
+                print(_SUBAGENT_PUBLISH_DENY.format(what=", ".join(refused)), file=sys.stderr)
+                return 2
+            # A line continuation or a length/nesting bound withholds the
+            # segments, so the check above saw nothing; the shell may still run
+            # a write there, including one whose verb it builds at run time
+            # (`git "$(printf …)"`). Without segments nothing can be matched to
+            # the allowlist, so a command naming git or gh is refused.
+            withheld = blind is not None and blind.bounds_induced
+            if (withheld and mentions(cmd, _GIT_OR_GH_MENTION)) or any(
+                _program_may_be_git_or_gh(s, cmd) for s in segs
+            ):
+                print(_SUBAGENT_UNREADABLE_DENY, file=sys.stderr)
+                return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
@@ -13851,7 +14486,8 @@ def _run_merge_and_push_gates() -> int:
                         # ask, scope checked only when the key is off.
                         publish_off = _ask_suppressed("push_publish")
                         if publish_off and _push_publish_scope_holds(
-                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur
+                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur,
+                            hook_cwd=payload.get("cwd") if isinstance(payload, dict) else None,
                         ):
                             publish_note = _suppressed_reason(
                                 "push_publish",
