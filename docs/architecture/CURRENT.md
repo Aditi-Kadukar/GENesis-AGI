@@ -1512,8 +1512,13 @@ verified: 637f7f7bb679 2026-10-05
   launches without a copy). The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
   the newest copy per profile, and the newest per version for 90 days.
-  `provision.py` (run by `scripts/install_browser_stack.sh`,
-  unit `genesis-browser-stack.service`) installs what the tools launch: the
+  Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
+  patchright on one minor): bootstrap.sh and install.sh install it after the core
+  packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
+  `provision.py check-packages`). `provision.py` (run by
+  `scripts/install_browser_stack.sh`: unit `genesis-browser-stack.service`, which
+  bootstrap starts without waiting and its daily timer retries; inline in
+  install.sh) installs what the tools launch: the
   engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
   empties the cache and 0.5.3-0.5.6 have no pin), the Chromium the fallback
   launches (`chromium.py`: patchright's when installed, else playwright's; where
@@ -1523,7 +1528,13 @@ verified: 637f7f7bb679 2026-10-05
   `sudo -n`, else the command is printed). Free space is checked on every
   destination with the disk guardian's effective figure (`util/disk_headroom.py`);
   every step's timeout comes off one run budget inside the unit's limit. One
-  outcome line; a re-run is a no-op. The automation TOOLS live in
+  outcome line; a re-run is a no-op. The Chromium launches refuse with the
+  operator step while their build is not installed: the MCP fallback judges it at
+  the executable its started driver names, the CLI where the package's dry-run says
+  the headless shell lives. The `browser_automation` capability is probed when
+  genesis-server starts, so after an update that pins a new engine it reads
+  degraded until the next restart after the unit finishes (documented, not
+  refreshed). The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:
