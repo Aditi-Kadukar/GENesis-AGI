@@ -722,7 +722,8 @@ jobs:
         # if that fails, so read those first when the count rises.
         # The collected-count floor that shared this line until #2743, and its
         # ledger of hand counts, are in this file's git history.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124
+        # Hook-output property tests (#3187): four strict xfails, ceiling 124 -> 128.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 128
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
