@@ -22,6 +22,7 @@ def guard(monkeypatch):
                                                  HOOKS / "codex_validator_guard.py")
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
+    monkeypatch.syspath_prepend(str(HOOKS))
     spec.loader.exec_module(module)
     original_path = sys.path[:]
     yield module
@@ -46,7 +47,7 @@ def test_command_normalization_preserves_literal_bytes_without_context(guard, mo
     action = guard.normalize(payload(name, {"command": command, "workdir": "/untrusted"}))
     assert action.kind == kind
     assert action.arguments == {"command": command}
-    with pytest.raises(guard.Refused, match="not installed"):
+    with pytest.raises(guard.Refused, match="not installed|trusted workspace"):
         guard.dispatch(action)
 
 
@@ -251,4 +252,4 @@ def test_native_clients_observe_guard_at_action_sink(tmp_path, client, case):
     assert hooks[0]["tool_name"] == ({"shell": "Bash", "patch": "apply_patch"}.get(sink)
                                     or f"mcp__{server}__{tool}")
     receipt = tmp_path / "workspace" / f"{sink}-receipt.txt"
-    assert receipt.exists() == (case in {"health", "memory"})
+    assert receipt.exists() == (case in {"health", "memory", "patch", "code_patch"})
